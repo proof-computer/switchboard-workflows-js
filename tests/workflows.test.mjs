@@ -64,6 +64,45 @@ describe("SwitchboardDeployWorkflow", () => {
     ]);
   });
 
+  it("keeps polling when route refresh reports runtime HTTPS is not ready", async () => {
+    const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ routeNotReadyOnce: true }));
+    let snapshot = workflow.snapshot;
+    for (let attempt = 0; attempt < 10 && snapshot.step !== "dns_propagated"; attempt += 1) {
+      snapshot = await workflow.advanceOnce();
+    }
+    assert.equal(snapshot.step, "dns_propagated");
+
+    const retry = await workflow.advanceOnce();
+    assert.equal(retry.step, "dns_propagated");
+    assert.equal(retry.events.at(-1).type, "route_not_ready");
+    assert.equal(retry.events.at(-1).details.reason, "runtime_https_not_ready");
+    assert.equal(retry.events.at(-1).details.healthStage, "relay_response");
+
+    const complete = await workflow.runToBlocked();
+    assert.equal(complete.step, "complete");
+    assert.ok(complete.events.some((event) => event.type === "route_active"));
+  });
+
+  it("keeps polling when route refresh has a transient upstream failure", async () => {
+    const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ routeRefreshTransientOnce: true }));
+    let snapshot = workflow.snapshot;
+    for (let attempt = 0; attempt < 10 && snapshot.step !== "dns_propagated"; attempt += 1) {
+      snapshot = await workflow.advanceOnce();
+    }
+    assert.equal(snapshot.step, "dns_propagated");
+
+    const retry = await workflow.advanceOnce();
+    assert.equal(retry.step, "dns_propagated");
+    assert.equal(retry.events.at(-1).type, "route_not_ready");
+    assert.equal(retry.events.at(-1).details.error, "route_refresh_unavailable");
+    assert.equal(retry.events.at(-1).details.reason, "route_refresh_transient");
+    assert.equal(retry.events.at(-1).details.httpStatus, 502);
+
+    const complete = await workflow.runToBlocked();
+    assert.equal(complete.step, "complete");
+    assert.ok(complete.events.some((event) => event.type === "route_active"));
+  });
+
   it("pauses on off-process funding and resumes from a redacted receipt", async () => {
     const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ requireFundingAction: true }));
     const blocked = await workflow.runToBlocked();
@@ -373,6 +412,7 @@ function groupWorkflowInput() {
 
 function fakeAdapters(options = {}) {
   let runtimeReadCount = 0;
+  let routeRefreshCount = 0;
   return {
     controlPlane: {
       async createDeploymentIntent(input) {
@@ -508,6 +548,23 @@ function fakeAdapters(options = {}) {
           id: intentId,
           cliToken: requestOptions?.cliToken
         });
+        routeRefreshCount += 1;
+        if (options.routeNotReadyOnce && routeRefreshCount === 1) {
+          throw new Error(
+            `POST /v1/deployment-intents/${intentId}/route-refresh failed (409): ` +
+            JSON.stringify({
+              error: "route_not_ready",
+              reason: "runtime_https_not_ready",
+              health: {
+                state: "certificate_requesting",
+                details: { stage: "relay_response" }
+              }
+            })
+          );
+        }
+        if (options.routeRefreshTransientOnce && routeRefreshCount === 1) {
+          throw new Error(`POST /v1/deployment-intents/${intentId}/route-refresh failed (502): `);
+        }
         return { ok: true, route: { status: "active", hostname: "e-test.acurast.ingress.works" } };
       },
       async refreshDeploymentIntentGroupMemberRoute(_groupId, intentId) {

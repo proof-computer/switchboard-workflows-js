@@ -20,6 +20,7 @@ export type SwitchboardDeployWorkflowStep =
   | "funding_action_required"
   | "funding_submitted"
   | "dns_propagated"
+  | "route_not_ready"
   | "route_active"
   | "registration_observed"
   | "validation_observed"
@@ -764,9 +765,24 @@ export class SwitchboardDeployWorkflow {
 
   private async refreshRoute(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
-    const status = await this.adapters.controlPlane.refreshDeploymentIntentRoute(deploymentIntent.intentId, {
-      cliToken: deploymentIntent.cliToken
-    });
+    let status: Record<string, unknown>;
+    try {
+      status = await this.adapters.controlPlane.refreshDeploymentIntentRoute(deploymentIntent.intentId, {
+        cliToken: deploymentIntent.cliToken
+      });
+    } catch (error) {
+      const retry = retryableRouteRefreshDetails(error);
+      if (!retry) throw error;
+      status = {
+        ok: false,
+        retryable: true,
+        route: { status: "pending", reason: stringValue(retry.reason) },
+        ...retry
+      };
+      this.snapshotValue.data.routeStatus = status;
+      this.transition("dns_propagated", "route_not_ready", retry);
+      return;
+    }
     this.snapshotValue.data.routeStatus = status;
     const route = recordValue(status.route ?? recordValue(status.intent).route);
     if (route.status === "active" || route.status === undefined) {
@@ -1071,6 +1087,43 @@ function recordValue(value: unknown): JsonObject {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function retryableRouteRefreshDetails(error: unknown): JsonObject | undefined {
+  const message = errorMessage(error);
+  const lower = message.toLowerCase();
+  if (!lower.includes("/route-refresh")) return undefined;
+  const parsed = parseJsonTail(message);
+  const httpStatus = routeRefreshHttpStatus(message);
+  const routeNotReady = lower.includes("route_not_ready") || stringValue(parsed?.error) === "route_not_ready";
+  const transientStatus = httpStatus === 502 || httpStatus === 503 || httpStatus === 504;
+  if (!routeNotReady && !transientStatus) return undefined;
+  const health = recordValue(parsed?.health);
+  const details = recordValue(health.details);
+  return {
+    error: stringValue(parsed?.error) ?? (transientStatus ? "route_refresh_unavailable" : "route_not_ready"),
+    reason: stringValue(parsed?.reason) ?? (lower.includes("runtime_https_not_ready") ? "runtime_https_not_ready" : transientStatus ? "route_refresh_transient" : undefined),
+    httpStatus,
+    healthState: stringValue(health.state),
+    healthStage: stringValue(details.stage),
+    message
+  };
+}
+
+function routeRefreshHttpStatus(message: string): number | undefined {
+  const match = message.match(/failed \((\d{3})\)/);
+  if (!match) return undefined;
+  return Number(match[1]);
+}
+
+function parseJsonTail(message: string): JsonObject | undefined {
+  const start = message.indexOf("{");
+  if (start < 0) return undefined;
+  try {
+    return recordValue(JSON.parse(message.slice(start)));
+  } catch {
+    return undefined;
+  }
 }
 
 function requiredString(value: unknown, label: string): string {

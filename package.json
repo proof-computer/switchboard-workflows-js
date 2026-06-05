@@ -1,6 +1,6 @@
 {
   "name": "@proof-computer/switchboard-workflows",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Executor-neutral Switchboard deployment workflows and host-side helpers.",
   "repository": {
     "type": "git",

@@ -83,6 +83,35 @@ describe("SwitchboardDeployWorkflow", () => {
     assert.ok(complete.events.some((event) => event.type === "route_active"));
   });
 
+  it("fails before route refresh when the activation window is expiring", async () => {
+    const originalDateNow = Date.now;
+    const nowMs = Date.parse("2026-06-07T12:00:00.000Z");
+    const protectedCalls = [];
+    const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({
+      activationDeadline: String(Math.floor((nowMs + 30_000) / 1000)),
+      protectedCalls
+    }));
+    Date.now = () => nowMs;
+    try {
+      let snapshot = workflow.snapshot;
+      for (let attempt = 0; attempt < 10 && snapshot.step !== "dns_propagated"; attempt += 1) {
+        snapshot = await workflow.advanceOnce();
+      }
+      assert.equal(snapshot.step, "dns_propagated");
+
+      const failed = await workflow.advanceOnce();
+      assert.equal(failed.step, "failed");
+      assert.equal(failed.events.at(-1).type, "activation_window_expiring");
+      assert.equal(failed.events.at(-1).details.reason, "activation_window_expiring");
+      assert.equal(
+        protectedCalls.some((call) => call.method === "refreshDeploymentIntentRoute"),
+        false
+      );
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
   it("keeps polling when route refresh has a transient upstream failure", async () => {
     const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ routeRefreshTransientOnce: true }));
     let snapshot = workflow.snapshot;
@@ -527,7 +556,17 @@ function fakeAdapters(options = {}) {
         return {
           ok: true,
           intent: {
-            funding: { status: "funded", sessionId: `0x${"22".repeat(32)}` },
+            funding: {
+              status: "funded",
+              sessionId: `0x${"22".repeat(32)}`,
+              session: options.activationDeadline
+                ? {
+                    activationDeadline: options.activationDeadline,
+                    paidSeconds: "120",
+                    registered: true
+                  }
+                : undefined
+            },
             dns: { status: "propagated", hostname: "e-test.acurast.ingress.works" }
           }
         };

@@ -9,6 +9,8 @@ import type {
 } from "./control-plane.js";
 import type { QuoteResponse } from "./funding.js";
 
+const DEFAULT_ACTIVATION_DEADLINE_SAFETY_MS = 60_000;
+
 export type SwitchboardDeployWorkflowStep =
   | "initialized"
   | "capacity_selected"
@@ -765,6 +767,18 @@ export class SwitchboardDeployWorkflow {
 
   private async refreshRoute(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
+    const activationWindow = activationWindowStatus(this.snapshotValue.data.fundingStatus);
+    if (activationWindow) {
+      const reason = stringValue(activationWindow.reason) ?? "activation_window_expired";
+      this.snapshotValue.data.routeStatus = {
+        ok: false,
+        error: reason,
+        route: { status: "failed", reason },
+        ...activationWindow
+      };
+      this.transition("failed", reason, activationWindow);
+      return;
+    }
     let status: Record<string, unknown>;
     try {
       status = await this.adapters.controlPlane.refreshDeploymentIntentRoute(deploymentIntent.intentId, {
@@ -1108,6 +1122,46 @@ function retryableRouteRefreshDetails(error: unknown): JsonObject | undefined {
     healthStage: stringValue(details.stage),
     message
   };
+}
+
+function activationWindowStatus(fundingStatus: unknown, nowMs = Date.now()): JsonObject | undefined {
+  const activationDeadlineSeconds = activationDeadlineSecondsFromFundingStatus(fundingStatus);
+  if (activationDeadlineSeconds === undefined) {
+    return undefined;
+  }
+  const activationDeadlineMs = activationDeadlineSeconds * 1000;
+  const remainingMs = activationDeadlineMs - nowMs;
+  if (remainingMs > DEFAULT_ACTIVATION_DEADLINE_SAFETY_MS) {
+    return undefined;
+  }
+  return {
+    reason: remainingMs <= 0 ? "activation_window_expired" : "activation_window_expiring",
+    activationDeadline: String(Math.floor(activationDeadlineSeconds)),
+    activationDeadlineIso: new Date(activationDeadlineMs).toISOString(),
+    activationDeadlineRemainingMs: remainingMs,
+    activationDeadlineSafetyMs: DEFAULT_ACTIVATION_DEADLINE_SAFETY_MS
+  };
+}
+
+function activationDeadlineSecondsFromFundingStatus(fundingStatus: unknown): number | undefined {
+  const status = recordValue(fundingStatus);
+  const intent = recordValue(status.intent);
+  const funding = recordValue(intent.funding ?? status.funding);
+  const session = recordValue(funding.session);
+  return positiveNumberValue(session.activationDeadline) ??
+    positiveNumberValue(funding.activationDeadline) ??
+    positiveNumberValue(status.activationDeadline);
+}
+
+function positiveNumberValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  }
+  return undefined;
 }
 
 function routeRefreshHttpStatus(message: string): number | undefined {

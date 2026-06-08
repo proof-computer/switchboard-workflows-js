@@ -23,7 +23,18 @@ export interface DeploymentIntentCreateInput {
   developer?: string;
   asset?: string;
   maxAmount?: string;
+  ingress?: SwitchboardIngressRequirement;
   source?: Record<string, unknown>;
+}
+
+export interface SwitchboardIngressRequirement {
+  implementor: "switchboard";
+  transport?: "forward" | "reverse";
+  hostname?: string;
+  port?: number;
+  protocol?: "http" | "https" | "tcp";
+  tlsMode?: "job-owned" | "managed" | "none";
+  healthPath?: string;
 }
 
 export interface DeploymentIntentGroupCreateInput {

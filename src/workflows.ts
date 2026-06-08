@@ -5,6 +5,7 @@ import type {
   DeploymentIntentCreateInput,
   DeploymentIntentGroupBootstrap,
   DeploymentIntentGroupCreateInput,
+  SwitchboardIngressRequirement,
   SwitchboardControlPlaneClient
 } from "./control-plane.js";
 import type { QuoteResponse } from "./funding.js";
@@ -51,6 +52,7 @@ export interface SwitchboardDeployWorkflowInput {
   certificateMode?: "job-acme" | "self-signed";
   validatorMode?: "skip" | "local" | "acurast";
   capacity?: SwitchboardCapacitySelection;
+  ingress?: SwitchboardIngressRequirement;
   group?: {
     expectedReplicas: number;
     minReady: number;
@@ -456,7 +458,18 @@ export class SwitchboardDeployWorkflow {
 
   private async selectCapacity(): Promise<void> {
     const capacity = this.snapshotValue.input.capacity ?? await this.adapters.capacity?.select(this.snapshotValue.input);
-    if (!capacity) throw new Error("No capacity selection is available for deploy workflow");
+    if (!capacity) {
+      if (workflowInputHasRelayAllocatedIngress(this.snapshotValue.input)) {
+        const relayCapacity = {
+          selection: "relay-deployment-intent-allocation",
+          ingress: this.snapshotValue.input.ingress
+        };
+        this.snapshotValue.data.capacity = relayCapacity;
+        this.transition("capacity_selected", "relay_capacity_required", relayCapacity);
+        return;
+      }
+      throw new Error("No capacity selection is available for deploy workflow");
+    }
     this.snapshotValue.data.capacity = capacity as unknown as JsonObject;
     this.transition("capacity_selected", "capacity_selected", capacity as unknown as JsonObject);
   }
@@ -473,16 +486,21 @@ export class SwitchboardDeployWorkflow {
       jobId: input.jobId,
       sessionLabel: input.sessionLabel ?? `switchboard-${this.snapshotValue.workflowId}`,
       developer: input.developer,
-      operatorId: stringValue(capacity.operatorId),
-      processorId: stringValue(capacity.processorId),
+      operatorId: hex32String(capacity.operatorId),
+      processorId: hex32String(capacity.processorId),
       gatewayId: stringValue(capacity.gatewayId),
       asset: input.asset,
       maxAmount: input.quoteCapAmount,
+      ingress: input.ingress,
       source: { mode: "switchboard-sdk-workflow", workflowId: this.snapshotValue.workflowId, ...(input.source ?? {}) }
     };
     const intent = await this.adapters.controlPlane.createDeploymentIntent(body);
+    const selectedCapacity = deploymentIntentCapacity(intent);
+    if (selectedCapacity) {
+      this.snapshotValue.data.capacity = selectedCapacity;
+    }
     this.snapshotValue.data.deploymentIntent = intent as unknown as JsonObject;
-    this.transition("intent_created", "intent_created", { intentId: intent.intentId });
+    this.transition("intent_created", "intent_created", { intentId: intent.intentId, relayAllocatedCapacity: Boolean(selectedCapacity) });
   }
 
   private async createGroupIntent(): Promise<void> {
@@ -1101,6 +1119,35 @@ function recordValue(value: unknown): JsonObject {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function hex32String(value: unknown): string | undefined {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/u.test(value) ? value : undefined;
+}
+
+function workflowInputHasRelayAllocatedIngress(input: SwitchboardDeployWorkflowInput): boolean {
+  return input.ingress?.implementor === "switchboard";
+}
+
+function deploymentIntentCapacity(intent: DeploymentIntentBootstrap): JsonObject | undefined {
+  const publicIntent = recordValue(intent.intent);
+  const rawIntent = recordValue(recordValue(intent.raw).intent);
+  const allocation = recordValue(publicIntent.allocation ?? rawIntent.allocation);
+  const operatorId = hex32String(publicIntent.operatorId) ?? hex32String(rawIntent.operatorId) ?? hex32String(allocation.operatorId);
+  const processorId = hex32String(publicIntent.processorId) ?? hex32String(rawIntent.processorId) ?? hex32String(allocation.processorId);
+  if (!operatorId || !processorId) return undefined;
+  return withoutUndefined({
+    ...allocation,
+    operatorId,
+    processorId,
+    processor: hex32String(publicIntent.processor) ?? hex32String(rawIntent.processor) ?? hex32String(allocation.processor) ?? processorId,
+    gatewayId: stringValue(publicIntent.gatewayId) ?? stringValue(rawIntent.gatewayId) ?? stringValue(allocation.gatewayId),
+    managerId: stringValue(publicIntent.managerId) ?? stringValue(rawIntent.managerId) ?? stringValue(allocation.managerId)
+  });
+}
+
+function withoutUndefined(input: JsonObject): JsonObject {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as JsonObject;
 }
 
 function retryableRouteRefreshDetails(error: unknown): JsonObject | undefined {

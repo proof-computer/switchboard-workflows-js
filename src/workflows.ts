@@ -1161,14 +1161,29 @@ function retryableRouteRefreshDetails(error: unknown): JsonObject | undefined {
   if (!routeNotReady && !transientStatus) return undefined;
   const health = recordValue(parsed?.health);
   const details = recordValue(health.details);
-  return {
+  const retryAfterMs =
+    positiveNumberValue(parsed?.retryAfterMs) ??
+    positiveNumberValue(parsed?.retryMs) ??
+    positiveNumberValue(details.retryAfterMs) ??
+    positiveNumberValue(details.retryMs);
+  return withoutUndefined({
     error: stringValue(parsed?.error) ?? (transientStatus ? "route_refresh_unavailable" : "route_not_ready"),
     reason: stringValue(parsed?.reason) ?? (lower.includes("runtime_https_not_ready") ? "runtime_https_not_ready" : transientStatus ? "route_refresh_transient" : undefined),
+    requestId: stringValue(parsed?.requestId) ?? stringValue(details.requestId),
     httpStatus,
     healthState: stringValue(health.state),
     healthStage: stringValue(details.stage),
+    healthDetails: Object.keys(details).length > 0 ? details : undefined,
+    healthUpdatedAt: stringValue(health.updatedAt),
+    elapsedMs: positiveNumberValue(parsed?.elapsedMs) ?? positiveNumberValue(parsed?.elapsedTimeMs) ?? positiveNumberValue(details.elapsedMs),
+    activationDeadline: stringValue(parsed?.activationDeadline) ?? stringValue(details.activationDeadline),
+    activationDeadlineIso: stringValue(parsed?.activationDeadlineIso) ?? stringValue(details.activationDeadlineIso),
+    activationDeadlineRemainingMs: positiveNumberValue(parsed?.activationDeadlineRemainingMs) ?? positiveNumberValue(details.activationDeadlineRemainingMs),
+    activationDeadlineSafetyMs: positiveNumberValue(parsed?.activationDeadlineSafetyMs) ?? positiveNumberValue(details.activationDeadlineSafetyMs),
+    retryAfterMs,
+    retryMs: retryAfterMs,
     message
-  };
+  });
 }
 
 function activationWindowStatus(fundingStatus: unknown, nowMs = Date.now()): JsonObject | undefined {

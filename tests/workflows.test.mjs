@@ -77,6 +77,14 @@ describe("SwitchboardDeployWorkflow", () => {
     assert.equal(retry.events.at(-1).type, "route_not_ready");
     assert.equal(retry.events.at(-1).details.reason, "runtime_https_not_ready");
     assert.equal(retry.events.at(-1).details.healthStage, "relay_response");
+    assert.equal(retry.events.at(-1).details.requestId, "req_route_ready");
+    assert.equal(retry.events.at(-1).details.retryMs, 30000);
+    assert.equal(retry.events.at(-1).details.elapsedMs, 120000);
+    assert.equal(retry.events.at(-1).details.healthUpdatedAt, "2026-06-08T12:00:00.000Z");
+    assert.equal(retry.events.at(-1).details.activationDeadlineIso, "2026-06-08T12:10:00.000Z");
+    assert.equal(retry.events.at(-1).details.activationDeadlineRemainingMs, 480000);
+    assert.equal(retry.events.at(-1).details.healthDetails.attempt, 7);
+    assert.equal(retry.events.at(-1).details.healthDetails.hostname, "e-test.acurast.ingress.works");
 
     const complete = await workflow.runToBlocked();
     assert.equal(complete.step, "complete");
@@ -593,11 +601,22 @@ function fakeAdapters(options = {}) {
             `POST /v1/deployment-intents/${intentId}/route-refresh failed (409): ` +
             JSON.stringify({
               error: "route_not_ready",
+              requestId: "req_route_ready",
               reason: "runtime_https_not_ready",
               health: {
                 state: "certificate_requesting",
-                details: { stage: "relay_response" }
-              }
+                updatedAt: "2026-06-08T12:00:00.000Z",
+                details: {
+                  stage: "relay_response",
+                  attempt: 7,
+                  hostname: "e-test.acurast.ingress.works",
+                  retryMs: 30000,
+                  elapsedMs: 120000,
+                  activationDeadlineIso: "2026-06-08T12:10:00.000Z",
+                  activationDeadlineRemainingMs: 480000
+                }
+              },
+              retryAfterMs: 30000
             })
           );
         }

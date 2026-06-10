@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
 
 import type {
   DeploymentIntentBootstrap,
@@ -51,6 +52,20 @@ export interface SwitchboardDeployWorkflowInput {
   quoteCapAmount?: string;
   certificateMode?: "job-acme" | "self-signed";
   validatorMode?: "skip" | "local" | "acurast";
+  /**
+   * When true, the DNS gate additionally confirms the canonical hostname
+   * resolves from the deployer's own vantage point (a real lookup) before
+   * declaring DNS ready — the relay's `propagated` status only reflects the
+   * relay's configured public resolvers, not the deployer's. Opt-in: the public
+   * CLI enables this for real deploys; lab/insecure deploys leave it off.
+   */
+  confirmPublicDnsResolution?: boolean;
+  /**
+   * How long to keep waiting for the deployer-vantage DNS resolution to succeed
+   * after the relay reports the canonical record `propagated`, before failing
+   * the deploy at the DNS stage. Defaults to 90s.
+   */
+  dnsResolutionGraceMs?: number;
   capacity?: SwitchboardCapacitySelection;
   ingress?: SwitchboardIngressRequirement;
   group?: {
@@ -235,6 +250,26 @@ export interface ConfirmationAdapter {
   }): Promise<boolean>;
 }
 
+/**
+ * Resolves a public hostname from the deployer's own vantage point. The relay
+ * marks canonical DNS `propagated` only after its configured public resolvers
+ * confirm the record, but that does not guarantee the deployer's resolver can
+ * see it (or that the record stays live through the rest of the deploy). The
+ * gate uses this adapter to confirm resolution before declaring DNS ready.
+ */
+export interface DnsResolutionAdapter {
+  resolve(hostname: string): Promise<string[]>;
+}
+
+const defaultDnsResolutionAdapter: DnsResolutionAdapter = {
+  async resolve(hostname: string): Promise<string[]> {
+    const records = await dnsLookup(hostname, { all: true });
+    return records.map((record) => record.address).filter((address): address is string => Boolean(address));
+  }
+};
+
+const DEFAULT_DNS_RESOLUTION_GRACE_MS = 90_000;
+
 export interface WorkflowStore {
   save(snapshot: SwitchboardDeployWorkflowSnapshot): Promise<void> | void;
 }
@@ -257,6 +292,7 @@ export interface SwitchboardDeployWorkflowAdapters {
   funding: HubFundingAdapter;
   capacity?: CapacityAdapter;
   confirmation?: ConfirmationAdapter;
+  dns?: DnsResolutionAdapter;
   store?: WorkflowStore;
 }
 
@@ -745,6 +781,66 @@ export class SwitchboardDeployWorkflow {
     });
   }
 
+  private allocatedEndpointHostname(): string | undefined {
+    const quote = recordValue(this.snapshotValue.data.quote);
+    return stringValue(quote.endpointHostname) ?? stringValue(recordValue(quote.quote).endpointHostname);
+  }
+
+  private shouldConfirmDnsResolution(hostname: string | undefined): hostname is string {
+    return (
+      this.snapshotValue.input.confirmPublicDnsResolution === true &&
+      Boolean(hostname) &&
+      this.snapshotValue.input.allowInsecureHttp !== true
+    );
+  }
+
+  private async resolveDeployerHostname(hostname: string): Promise<{ resolved: boolean; addresses: string[]; error?: string }> {
+    const resolver = this.adapters.dns ?? defaultDnsResolutionAdapter;
+    try {
+      const addresses = await resolver.resolve(hostname);
+      return { resolved: addresses.length > 0, addresses };
+    } catch (error) {
+      return { resolved: false, addresses: [], error: errorMessage(error) };
+    }
+  }
+
+  /**
+   * Returns true once the deployer can resolve the canonical hostname (or when
+   * confirmation is not applicable: local/insecure deploys, or no hostname).
+   * Returns false while still waiting inside the grace window, and throws a
+   * DNS-attributed error once the grace window elapses.
+   */
+  private async confirmDeployerDnsResolution(hostname: string | undefined, relayDnsStatus: unknown): Promise<boolean> {
+    if (!this.shouldConfirmDnsResolution(hostname)) {
+      this.snapshotValue.data.dnsResolution = undefined;
+      this.snapshotValue.data.dnsPropagatedObservedAt = undefined;
+      return true;
+    }
+    const resolution = await this.resolveDeployerHostname(hostname);
+    this.snapshotValue.data.dnsResolution = {
+      hostname,
+      resolved: resolution.resolved,
+      addresses: resolution.addresses,
+      error: resolution.error,
+      checkedAt: new Date().toISOString()
+    };
+    if (resolution.resolved) {
+      this.snapshotValue.data.dnsPropagatedObservedAt = undefined;
+      return true;
+    }
+    const firstObservedAt = stringValue(this.snapshotValue.data.dnsPropagatedObservedAt) ?? new Date().toISOString();
+    this.snapshotValue.data.dnsPropagatedObservedAt = firstObservedAt;
+    const waitedMs = Date.now() - new Date(firstObservedAt).getTime();
+    const graceMs = this.snapshotValue.input.dnsResolutionGraceMs ?? DEFAULT_DNS_RESOLUTION_GRACE_MS;
+    if (waitedMs >= graceMs) {
+      throw new Error(
+        `Canonical DNS for ${hostname} is reported ${stringValue(relayDnsStatus) ?? "ready"} by the relay but did not resolve ` +
+          `from the deployer after ${Math.round(waitedMs / 1000)}s (dns_failed: ${resolution.error ?? "getaddrinfo ENOTFOUND"}).`
+      );
+    }
+    return false;
+  }
+
   private async refreshFundingAndDns(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
     const status = await this.adapters.controlPlane.refreshDeploymentIntentFunding(deploymentIntent.intentId, {
@@ -753,7 +849,18 @@ export class SwitchboardDeployWorkflow {
     this.snapshotValue.data.fundingStatus = status;
     const dns = recordValue(recordValue(status.intent).dns);
     if (dns.status === "propagated" || dns.status === undefined) {
-      this.transition("dns_propagated", "dns_propagated", dns);
+      const hostname = stringValue(dns.hostname) ?? this.allocatedEndpointHostname();
+      if (!(await this.confirmDeployerDnsResolution(hostname, dns.status))) {
+        // Relay reports the record published, but the deployer cannot resolve it
+        // yet. Stay in this step so the driver re-polls (giving propagation and
+        // peer convergence time); confirmDeployerDnsResolution throws once the
+        // grace window elapses so the failure is attributed to DNS.
+        return;
+      }
+      this.transition("dns_propagated", "dns_propagated", {
+        ...dns,
+        deployerResolution: recordValue(this.snapshotValue.data.dnsResolution)
+      });
     }
   }
 
@@ -769,7 +876,12 @@ export class SwitchboardDeployWorkflow {
       const intent = recordValue(status.intent);
       const funding = recordValue(intent.funding ?? status.funding);
       const dns = recordValue(intent.dns ?? status.dns);
-      if (funding.status === "funded" && (dns.status === "propagated" || dns.status === undefined)) {
+      const dnsReady = dns.status === "propagated" || dns.status === undefined;
+      const memberHostname = stringValue(dns.hostname) ?? stringValue(member.hostname);
+      const dnsResolves = dnsReady && this.shouldConfirmDnsResolution(memberHostname)
+        ? (await this.resolveDeployerHostname(memberHostname!)).resolved
+        : dnsReady;
+      if (funding.status === "funded" && dnsReady && dnsResolves) {
         ready.push(member);
       }
     }

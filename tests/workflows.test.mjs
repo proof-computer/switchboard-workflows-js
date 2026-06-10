@@ -140,6 +140,44 @@ describe("SwitchboardDeployWorkflow", () => {
     assert.ok(complete.events.some((event) => event.type === "route_active"));
   });
 
+  it("keeps waiting at funding_submitted while the deployer cannot resolve the canonical hostname", async () => {
+    const workflow = new SwitchboardDeployWorkflow(
+      { ...input, confirmPublicDnsResolution: true, dnsResolutionGraceMs: 600_000 },
+      fakeAdapters({ dnsUnresolved: true })
+    );
+    const snapshot = await workflow.runToBlocked();
+    assert.equal(snapshot.step, "funding_submitted");
+    assert.equal(snapshot.data.dnsResolution.resolved, false);
+    assert.match(snapshot.data.dnsResolution.error, /ENOTFOUND/);
+  });
+
+  it("fails at the DNS stage when the canonical hostname never resolves for the deployer", async () => {
+    const workflow = new SwitchboardDeployWorkflow(
+      { ...input, confirmPublicDnsResolution: true, dnsResolutionGraceMs: 0 },
+      fakeAdapters({ dnsUnresolved: true })
+    );
+    await assert.rejects(() => workflow.runToBlocked(), /dns_failed/);
+    assert.equal(workflow.snapshot.step, "failed");
+    const failure = workflow.snapshot.events.at(-1);
+    assert.equal(failure.type, "workflow_failed");
+    assert.match(failure.details.error, /did not resolve/);
+  });
+
+  it("skips deployer DNS resolution for insecure/local deploys even when confirmation is enabled", async () => {
+    const workflow = new SwitchboardDeployWorkflow(
+      { ...input, confirmPublicDnsResolution: true, allowInsecureHttp: true },
+      fakeAdapters({ dnsUnresolved: true })
+    );
+    const snapshot = await workflow.runToBlocked();
+    assert.equal(snapshot.step, "complete");
+  });
+
+  it("does not require deployer DNS resolution unless confirmation is opted in", async () => {
+    const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ dnsUnresolved: true }));
+    const snapshot = await workflow.runToBlocked();
+    assert.equal(snapshot.step, "complete");
+  });
+
   it("pauses on off-process funding and resumes from a redacted receipt", async () => {
     const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ requireFundingAction: true }));
     const blocked = await workflow.runToBlocked();
@@ -680,6 +718,16 @@ function fakeAdapters(options = {}) {
           };
         }
         return { txHash: "0xfund", status: "inBlock" };
+      }
+    },
+    dns: {
+      async resolve(hostname) {
+        if (options.dnsUnresolved) {
+          const error = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+          error.code = "ENOTFOUND";
+          throw error;
+        }
+        return options.dnsAddresses ?? ["203.0.113.10"];
       }
     },
     store: options.saved ? { save: (snapshot) => options.saved.push(snapshot) } : undefined
